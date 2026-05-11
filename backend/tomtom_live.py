@@ -1,13 +1,10 @@
 """
 TomTom live traffic adapter for TrafficOS.
 
-Purpose:
-- Fetch real TomTom Traffic Flow data from the backend.
-- Never expose TOMTOM_API_KEY to the frontend.
-- Generate dense live traffic samples for Fusagasugá and central San Francisco.
-- Return both:
-  1. GeoJSON FeatureCollection for Mapbox rendering
-  2. segments[] for the TrafficOS sidebar/cards
+- Fetches real TomTom Traffic Flow data from the backend.
+- Never exposes TOMTOM_API_KEY to the frontend.
+- Generates dense live traffic samples for Fusagasugá and central San Francisco.
+- Returns both GeoJSON FeatureCollection and segments[].
 """
 
 import os
@@ -19,44 +16,35 @@ from typing import Any, Dict, List, Tuple
 import httpx
 
 
-# ── Secrets / Config ──────────────────────────────────────────────────────────
-
 TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY", "").strip()
 
-CACHE_TTL_SECONDS = int(os.getenv("TOMTOM_CACHE_TTL_SECONDS", "60"))
-TOMTOM_CONCURRENCY = int(os.getenv("TOMTOM_CONCURRENCY", "12"))
+CACHE_TTL_SECONDS = int(os.getenv("TOMTOM_CACHE_TTL_SECONDS", "90"))
+TOMTOM_CONCURRENCY = int(os.getenv("TOMTOM_CONCURRENCY", "16"))
 
-# Bigger = more TomTom calls. Keep sane for demo/quota.
 MAX_POINTS = {
-    "fusagasuga": int(os.getenv("TOMTOM_MAX_POINTS_FUSA", "90")),
-    "san_francisco": int(os.getenv("TOMTOM_MAX_POINTS_SF", "90")),
+    "fusagasuga": int(os.getenv("TOMTOM_MAX_POINTS_FUSA", "160")),
+    "san_francisco": int(os.getenv("TOMTOM_MAX_POINTS_SF", "220")),
 }
 
 _CACHE: Dict[str, Dict[str, Any]] = {}
 
 
-# ── City Sampling Regions ─────────────────────────────────────────────────────
-# Format: (lat_min, lat_max, lon_min, lon_max)
-
 CITY_BBOX = {
-    # Covers the main Fusagasugá urban area and surrounding corridors.
     "fusagasuga": {
+        # Main urban Fusagasugá + surrounding corridors
         "bbox": (4.3180, 4.3535, -74.3880, -74.3380),
-        "rows": 12,
-        "cols": 12,
+        "rows": 16,
+        "cols": 16,
     },
-
-    # Central SF region matching your screenshot:
-    # Fillmore / Civic Center / SoMa / Mission / downtown area.
     "san_francisco": {
-        "bbox": (37.7480, 37.7950, -122.4450, -122.3850),
-        "rows": 12,
-        "cols": 12,
+        # Central SF: Fillmore, Civic Center, SoMa, Mission, downtown
+        "bbox": (37.7480, 37.7960, -122.4470, -122.3880),
+        "rows": 18,
+        "cols": 18,
     },
 }
 
 
-# Strategic anchor points so important roads are sampled even if grid misses them.
 ANCHOR_POINTS: Dict[str, List[Tuple[float, float, str]]] = {
     "fusagasuga": [
         (4.3379, -74.3649, "Calle 18"),
@@ -74,6 +62,11 @@ ANCHOR_POINTS: Dict[str, List[Tuple[float, float, str]]] = {
         (4.3457, -74.3547, "Comuna Norte"),
         (4.3298, -74.3496, "La Florida"),
         (4.3215, -74.3607, "La Alejandría"),
+        (4.3331, -74.3525, "Comuna Oriental"),
+        (4.3283, -74.3604, "Comuna Sur"),
+        (4.3460, -74.3665, "Cucharal Urbano"),
+        (4.3360, -74.3720, "Variante de Fusagasugá"),
+        (4.3310, -74.3775, "Salida Silvania"),
     ],
     "san_francisco": [
         (37.7749, -122.4194, "Market Street"),
@@ -91,11 +84,18 @@ ANCHOR_POINTS: Dict[str, List[Tuple[float, float, str]]] = {
         (37.7822, -122.3930, "SoMa East"),
         (37.7898, -122.4210, "Nob Hill South"),
         (37.7528, -122.4180, "Mission South"),
+        (37.7785, -122.4235, "Hayes Valley"),
+        (37.7715, -122.4300, "Lower Haight"),
+        (37.7810, -122.4315, "Japantown"),
+        (37.7862, -122.4327, "Pacific Heights South"),
+        (37.7757, -122.4032, "SoMa Central"),
+        (37.7710, -122.4075, "11th Street Corridor"),
+        (37.7598, -122.4267, "Mission Dolores"),
+        (37.7554, -122.4193, "Valencia Corridor"),
+        (37.7517, -122.4058, "Potrero Avenue"),
     ],
 }
 
-
-# ── Utility Functions ─────────────────────────────────────────────────────────
 
 def normalize_city(city: str) -> str:
     value = (city or "fusagasuga").lower().strip()
@@ -110,10 +110,6 @@ def normalize_city(city: str) -> str:
 
 
 def generate_grid_points(city_key: str) -> List[Tuple[float, float, str]]:
-    """
-    Generate a dense lat/lon grid across the selected city bounding box.
-    TomTom returns the nearest traffic flow segment for each sampled point.
-    """
     cfg = CITY_BBOX[city_key]
     lat_min, lat_max, lon_min, lon_max = cfg["bbox"]
     rows = cfg["rows"]
@@ -126,22 +122,24 @@ def generate_grid_points(city_key: str) -> List[Tuple[float, float, str]]:
 
         for c in range(cols):
             lon = lon_min + (lon_max - lon_min) * (c / max(cols - 1, 1))
-            points.append((lat, lon, f"{city_key.replace('_', ' ').title()} Grid {r + 1}-{c + 1}"))
+            points.append(
+                (
+                    lat,
+                    lon,
+                    f"{city_key.replace('_', ' ').title()} Grid {r + 1}-{c + 1}",
+                )
+            )
 
     return points
 
 
 def get_city_points(city_key: str) -> List[Tuple[float, float, str]]:
-    """
-    Combine anchors + generated grid, dedupe nearby identical points, and cap count.
-    """
     raw_points = ANCHOR_POINTS.get(city_key, []) + generate_grid_points(city_key)
 
     seen = set()
     unique: List[Tuple[float, float, str]] = []
 
     for lat, lon, name in raw_points:
-        # Round to avoid duplicate near-identical samples.
         key = (round(lat, 5), round(lon, 5))
         if key in seen:
             continue
@@ -152,23 +150,20 @@ def get_city_points(city_key: str) -> List[Tuple[float, float, str]]:
 
 
 def congestion_from_speed(current_speed: float, free_flow_speed: float) -> int:
-    """
-    Convert real TomTom speed degradation into TrafficOS congestion tier.
-    """
     if free_flow_speed <= 0:
         return 0
 
     ratio = current_speed / free_flow_speed
 
     if ratio >= 0.85:
-        return 0  # Free flow
+        return 0
     if ratio >= 0.65:
-        return 1  # Light
+        return 1
     if ratio >= 0.45:
-        return 2  # Moderate
+        return 2
     if ratio >= 0.25:
-        return 3  # Heavy
-    return 4      # Jam
+        return 3
+    return 4
 
 
 def status_from_level(level: int) -> str:
@@ -180,10 +175,6 @@ def estimate_density_from_speed(
     free_flow_speed: float,
     jam_density: float = 120.0,
 ) -> float:
-    """
-    TomTom gives speed/travel-time. TrafficOS estimates density through
-    speed degradation using a Greenshields-style relationship.
-    """
     if free_flow_speed <= 0:
         return 0.0
 
@@ -193,21 +184,19 @@ def estimate_density_from_speed(
 
 def geometry_signature(coordinates: List[List[float]]) -> str:
     """
-    Deduplicate TomTom segments by compressed coordinate signature.
+    Less aggressive dedupe so SF does not collapse too many nearby street segments.
     """
     if not coordinates:
         return ""
 
     compressed = [
-        [round(lon, 4), round(lat, 4)]
-        for lon, lat in coordinates[:: max(1, len(coordinates) // 5)]
+        [round(lon, 5), round(lat, 5)]
+        for lon, lat in coordinates
     ]
 
     raw = str(compressed).encode("utf-8")
     return hashlib.md5(raw).hexdigest()
 
-
-# ── TomTom Calls ──────────────────────────────────────────────────────────────
 
 async def fetch_flow_segment(
     client: httpx.AsyncClient,
@@ -217,9 +206,6 @@ async def fetch_flow_segment(
     fallback_name: str,
     idx: int,
 ) -> Dict[str, Any] | None:
-    """
-    Calls TomTom Flow Segment Data for one sampled point.
-    """
     async with semaphore:
         url = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
 
@@ -260,7 +246,6 @@ async def fetch_flow_segment(
             except Exception:
                 continue
 
-        # If TomTom does not return a polyline, draw a tiny local line.
         if len(coordinates) < 2:
             coordinates = [
                 [lon - 0.00045, lat - 0.00025],
@@ -277,6 +262,7 @@ async def fetch_flow_segment(
 
         segment = {
             "id": idx,
+            "segment_id": idx,
             "name": fallback_name,
             "speed_v": round(current_speed, 1),
             "free_flow_speed": round(free_flow_speed, 1),
@@ -295,6 +281,7 @@ async def fetch_flow_segment(
 
         feature = {
             "type": "Feature",
+            "id": idx,
             "properties": segment,
             "geometry": {
                 "type": "LineString",
@@ -310,11 +297,6 @@ async def fetch_flow_segment(
 
 
 async def get_tomtom_live_map_data(city: str = "fusagasuga") -> Dict[str, Any]:
-    """
-    Fetch real TomTom traffic flow for a dense city sample.
-
-    This is real TomTom traffic data, not simulated traffic.
-    """
     city_key = normalize_city(city)
     points = get_city_points(city_key)
 
@@ -338,7 +320,7 @@ async def get_tomtom_live_map_data(city: str = "fusagasuga") -> Dict[str, Any]:
 
     semaphore = asyncio.Semaphore(TOMTOM_CONCURRENCY)
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=20.0) as client:
         tasks = [
             fetch_flow_segment(
                 client=client,
@@ -368,7 +350,6 @@ async def get_tomtom_live_map_data(city: str = "fusagasuga") -> Dict[str, Any]:
 
         signature = item.get("signature", "")
 
-        # Deduplicate repeated TomTom road fragments returned by nearby samples.
         if signature and signature in seen_signatures:
             continue
 
@@ -376,9 +357,12 @@ async def get_tomtom_live_map_data(city: str = "fusagasuga") -> Dict[str, Any]:
 
         segment = item["segment"]
         segment["id"] = len(segments) + 1
+        segment["segment_id"] = segment["id"]
 
         feature = item["feature"]
+        feature["id"] = segment["id"]
         feature["properties"]["id"] = segment["id"]
+        feature["properties"]["segment_id"] = segment["id"]
 
         segments.append(segment)
         features.append(feature)
