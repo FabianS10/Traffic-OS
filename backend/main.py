@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text
@@ -17,6 +17,9 @@ from ingestion import router as ingestion_router, ingest_osm_roads
 from graph_api import router as graph_router
 from gemini import router as gemini_router
 from database import engine, Base, RoadSegment
+
+# Real TomTom live traffic adapter
+from tomtom_live import get_tomtom_live_map_data
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("trafficos")
@@ -52,8 +55,8 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
         log.info("Database tables checked/created.")
 
-    # Auto-init Fusagasugá if DB is empty.
-    # For Railway demo, set AUTO_INIT_OSM=false.
+    # Auto-init Fusagasugá only if explicitly enabled.
+    # For Railway demo, keep AUTO_INIT_OSM=false.
     auto_init_osm = env_bool("AUTO_INIT_OSM", "false")
 
     if auto_init_osm:
@@ -67,8 +70,6 @@ async def lifespan(app: FastAPI):
                     await ingest_osm_roads(city="fusagasuga")
                     log.info("OSM auto-init completed.")
                 except Exception as e:
-                    # Do not kill the whole deployment if OSM fetch fails.
-                    # The app can still serve demo/synthetic endpoints.
                     log.error(f"Auto-init failed. Check OSM connection: {e}")
             else:
                 log.info(f"Road network already initialized: {segment_count} segments.")
@@ -85,9 +86,6 @@ app = FastAPI(title="TrafficOS", lifespan=lifespan)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 
-# Supports both:
-# FRONTEND_URL=https://your-site.netlify.app
-# CORS_ORIGINS=https://site1.netlify.app,https://site2.netlify.app
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip()
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").strip()
 
@@ -139,6 +137,7 @@ async def api_health():
         "message": "TrafficOS is operational",
         "cities": ["Fusagasugá", "San Francisco"],
         "use_postgis": USE_POSTGIS,
+        "traffic_source": "TomTom live traffic",
     }
 
 
@@ -149,29 +148,49 @@ async def health():
         "message": "TrafficOS is operational",
         "cities": ["Fusagasugá", "San Francisco"],
         "use_postgis": USE_POSTGIS,
+        "traffic_source": "TomTom live traffic",
     }
 
 
 @app.get("/api/traffic/map-data")
-async def get_map_traffic():
+async def get_map_traffic(
+    city: str = Query(
+        default="fusagasuga",
+        description="Supported values: fusagasuga, san_francisco",
+    )
+):
     """
-    Railway-safe endpoint.
+    Real TomTom-powered traffic endpoint.
 
-    If USE_POSTGIS=false, avoid importing/running spatial PostGIS queries.
-    The frontend can still use graph/demo endpoints and synthetic city data.
+    Supported:
+    - /api/traffic/map-data?city=fusagasuga
+    - /api/traffic/map-data?city=san_francisco
+
+    The TomTom key stays on the backend. Netlify never sees it.
     """
-    if not USE_POSTGIS:
-        return {
-            "city": "demo",
-            "mode": "json-fallback-no-postgis",
-            "segments": [],
-            "features": [],
-            "type": "FeatureCollection",
-        }
+    return await get_tomtom_live_map_data(city=city)
 
-    # Import only when PostGIS is enabled, so Railway fallback does not touch it.
-    from database_spatial import get_fusa_street_grid_with_traffic
-    return await get_fusa_street_grid_with_traffic()
+
+@app.get("/api/cities")
+async def get_cities():
+    return {
+        "cities": [
+            {
+                "id": "fusagasuga",
+                "label": "Fusagasugá",
+                "country": "Colombia",
+                "mode": "tomtom-live",
+                "center": [-74.3649, 4.3379],
+            },
+            {
+                "id": "san_francisco",
+                "label": "San Francisco",
+                "country": "United States",
+                "mode": "tomtom-live",
+                "center": [-122.4194, 37.7749],
+            },
+        ]
+    }
 
 
 @app.get("/")
@@ -179,4 +198,6 @@ async def root():
     return {
         "message": "Neural Traffic API is running",
         "health_check": "/api/health",
+        "traffic_fusagasuga": "/api/traffic/map-data?city=fusagasuga",
+        "traffic_san_francisco": "/api/traffic/map-data?city=san_francisco",
     }
