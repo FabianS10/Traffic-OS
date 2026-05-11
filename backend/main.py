@@ -17,35 +17,44 @@ from ingestion import router as ingestion_router, ingest_osm_roads
 from graph_api import router as graph_router
 from gemini import router as gemini_router
 from database import engine, Base, RoadSegment
-from database_spatial import get_fusa_street_grid_with_traffic
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("trafficos")
 
 
 def env_bool(name: str, default: str = "false") -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+    return os.getenv(name, default).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+USE_POSTGIS = env_bool("USE_POSTGIS", "false")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("TrafficOS Neural Engine starting...")
 
-    # Create PostGIS extension before creating geometry columns.
     async with engine.begin() as conn:
-        try:
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
-            log.info("PostGIS extension checked/enabled.")
-        except Exception as e:
-            log.error(f"PostGIS extension could not be enabled: {e}")
-            raise
+        if USE_POSTGIS:
+            try:
+                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+                log.info("PostGIS extension checked/enabled.")
+            except Exception as e:
+                log.error(f"PostGIS extension could not be enabled: {e}")
+                raise
+        else:
+            log.info("USE_POSTGIS=false. Skipping PostGIS extension.")
 
         await conn.run_sync(Base.metadata.create_all)
         log.info("Database tables checked/created.")
 
     # Auto-init Fusagasugá if DB is empty.
-    # You can disable this on Railway with AUTO_INIT_OSM=false if startup is slow.
-    auto_init_osm = env_bool("AUTO_INIT_OSM", "true")
+    # For Railway demo, set AUTO_INIT_OSM=false.
+    auto_init_osm = env_bool("AUTO_INIT_OSM", "false")
 
     if auto_init_osm:
         async with AsyncSession(engine, expire_on_commit=False) as session:
@@ -129,6 +138,7 @@ async def api_health():
         "status": "ok",
         "message": "TrafficOS is operational",
         "cities": ["Fusagasugá", "San Francisco"],
+        "use_postgis": USE_POSTGIS,
     }
 
 
@@ -138,11 +148,29 @@ async def health():
         "status": "ok",
         "message": "TrafficOS is operational",
         "cities": ["Fusagasugá", "San Francisco"],
+        "use_postgis": USE_POSTGIS,
     }
 
 
 @app.get("/api/traffic/map-data")
 async def get_map_traffic():
+    """
+    Railway-safe endpoint.
+
+    If USE_POSTGIS=false, avoid importing/running spatial PostGIS queries.
+    The frontend can still use graph/demo endpoints and synthetic city data.
+    """
+    if not USE_POSTGIS:
+        return {
+            "city": "demo",
+            "mode": "json-fallback-no-postgis",
+            "segments": [],
+            "features": [],
+            "type": "FeatureCollection",
+        }
+
+    # Import only when PostGIS is enabled, so Railway fallback does not touch it.
+    from database_spatial import get_fusa_street_grid_with_traffic
     return await get_fusa_street_grid_with_traffic()
 
 

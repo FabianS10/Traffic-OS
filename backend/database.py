@@ -1,6 +1,9 @@
 """
-Database models — PostgreSQL + PostGIS
-Spatial queries via GeoAlchemy2
+Database models — PostgreSQL with optional PostGIS support.
+
+Railway-safe mode:
+- USE_POSTGIS=false stores geometry-like data as JSON.
+- USE_POSTGIS=true uses GeoAlchemy2 Geometry columns and requires PostGIS.
 """
 
 from datetime import datetime
@@ -24,7 +27,26 @@ from sqlalchemy import (
     JSON,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from geoalchemy2 import Geometry
+
+
+# ── Feature flags ─────────────────────────────────────────────────────────────
+
+USE_POSTGIS = os.getenv("USE_POSTGIS", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+if USE_POSTGIS:
+    from geoalchemy2 import Geometry
+
+    def GeoColumn(geom_type: str):
+        return Geometry(geom_type, srid=4326)
+else:
+    def GeoColumn(geom_type: str):
+        # Railway fallback: store coordinates/GeoJSON-like payloads as JSON.
+        return JSON
 
 
 # ── Database URL — Railway/local safe configuration ───────────────────────────
@@ -37,7 +59,7 @@ DATABASE_URL = os.getenv(
 # Railway often provides:
 # postgresql://user:password@host:port/db
 #
-# But SQLAlchemy async requires:
+# SQLAlchemy async requires:
 # postgresql+asyncpg://user:password@host:port/db
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace(
@@ -63,7 +85,10 @@ if "@db:" in DATABASE_URL and not os.getenv("RAILWAY_ENVIRONMENT"):
     DATABASE_URL = DATABASE_URL.replace("@db:", "@localhost:")
 
 # Never print DATABASE_URL. It contains the database password.
-print("Database engine configured.")
+print(
+    "Database engine configured. "
+    f"USE_POSTGIS={USE_POSTGIS}"
+)
 
 
 engine = create_async_engine(
@@ -128,7 +153,10 @@ class RoadSegment(Base):
     lanes = Column(Integer, default=2)
     speed_limit = Column(Float, default=50.0)
     jam_density = Column(Float, default=120.0)
-    geometry = Column(Geometry("LINESTRING", srid=4326))
+
+    # PostGIS mode: geometry(LINESTRING, 4326)
+    # Railway fallback: JSON
+    geometry = Column(GeoColumn("LINESTRING"))
 
     readings = relationship(
         "TrafficReading",
@@ -178,8 +206,12 @@ class SavedRoute(Base):
     name = Column(String(255))
     origin_name = Column(String(255))
     dest_name = Column(String(255))
-    origin = Column(Geometry("POINT", srid=4326))
-    destination = Column(Geometry("POINT", srid=4326))
+
+    # PostGIS mode: geometry(POINT, 4326)
+    # Railway fallback: JSON
+    origin = Column(GeoColumn("POINT"))
+    destination = Column(GeoColumn("POINT"))
+
     waypoints = Column(JSON, default=list)
     segment_ids = Column(JSON, default=list)
     created_at = Column(DateTime, default=datetime.utcnow)
