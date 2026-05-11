@@ -21,6 +21,9 @@ from database import engine, Base, RoadSegment
 # Real TomTom live traffic adapter
 from tomtom_live import get_tomtom_live_map_data
 
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("trafficos")
 
@@ -36,6 +39,8 @@ def env_bool(name: str, default: str = "false") -> bool:
 
 USE_POSTGIS = env_bool("USE_POSTGIS", "false")
 
+
+# ── Lifespan / Startup ────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -86,7 +91,7 @@ app = FastAPI(title="TrafficOS", lifespan=lifespan)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip()
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").strip()
 
 origins = [
@@ -94,6 +99,9 @@ origins = [
     "http://localhost:5173",
     "http://localhost:8000",
     "https://localhost:5173",
+
+    # Netlify production frontend
+    "https://traffic-os-hackathon.netlify.app",
 ]
 
 if FRONTEND_URL:
@@ -101,7 +109,7 @@ if FRONTEND_URL:
 
 if CORS_ORIGINS:
     origins.extend(
-        origin.strip()
+        origin.strip().rstrip("/")
         for origin in CORS_ORIGINS.split(",")
         if origin.strip()
     )
@@ -109,9 +117,12 @@ if CORS_ORIGINS:
 # Remove duplicates while preserving order
 origins = list(dict.fromkeys(origins))
 
+log.info(f"CORS origins enabled: {origins}")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"https://.*\.netlify\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -128,7 +139,7 @@ app.include_router(graph_router, prefix="/api/graph", tags=["Graph System"])
 app.include_router(gemini_router, prefix="/api/aria", tags=["ARIA Intelligence"])
 
 
-# ── Health / Root ─────────────────────────────────────────────────────────────
+# ── Health / Debug ────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 async def api_health():
@@ -151,6 +162,18 @@ async def health():
         "traffic_source": "TomTom live traffic",
     }
 
+
+@app.get("/api/debug/cors")
+async def debug_cors():
+    return {
+        "allowed_origins": origins,
+        "frontend_url": FRONTEND_URL,
+        "cors_origins_env": CORS_ORIGINS,
+        "netlify_regex": r"https://.*\.netlify\.app",
+    }
+
+
+# ── Traffic Data ──────────────────────────────────────────────────────────────
 
 @app.get("/api/traffic/map-data")
 async def get_map_traffic(
@@ -193,11 +216,14 @@ async def get_cities():
     }
 
 
+# ── Root ──────────────────────────────────────────────────────────────────────
+
 @app.get("/")
 async def root():
     return {
         "message": "Neural Traffic API is running",
         "health_check": "/api/health",
+        "cors_debug": "/api/debug/cors",
         "traffic_fusagasuga": "/api/traffic/map-data?city=fusagasuga",
         "traffic_san_francisco": "/api/traffic/map-data?city=san_francisco",
     }
