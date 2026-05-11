@@ -377,7 +377,7 @@ Production authentication can be enabled separately.
 
 ### Long-Term
 
-* Calibrate with real traffic data.
+* Calibrate with more robust real traffic data.
 * Add enterprise fleet integrations.
 * Add municipal planning tools.
 * Add mobile PWA support.
@@ -385,7 +385,7 @@ Production authentication can be enabled separately.
 
 ---
 
-## Suggested Pitch
+## Business Pitch
 
 > **TrafficOS is a predictive traffic command center for cities and fleets. It helps operators understand congestion, compare route risk, reduce wasted time, and generate actionable traffic intelligence reports.**
 
