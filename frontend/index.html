@@ -1,0 +1,42 @@
+  <!DOCTYPE html>
+  <html lang="es">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <title>TrafficOS · Multi-City</title>
+      <meta name="description" content="Urban traffic prediction platform — F.A.S.C. Machine Learning Solutions" />
+
+      <!-- Space Mono — mission control aesthetic -->
+      <link rel="preconnect" href="https://fonts.googleapis.com" />
+      <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+      <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet" />
+
+      <!-- Mapbox GL JS -->
+      <link href="https://api.mapbox.com/mapbox-gl-js/v3.6.0/mapbox-gl.css" rel="stylesheet" />
+      <script src="https://api.mapbox.com/mapbox-gl-js/v3.6.0/mapbox-gl.js"></script>
+
+      <!-- Chart.js -->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+
+      <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body, #root { height: 100%; }
+        body {
+          background: #080E1A;
+          color: #E8F4F4;
+          font-family: 'Space Mono', monospace;
+          -webkit-font-smoothing: antialiased;
+        }
+        ::-webkit-scrollbar { width: 4px; height: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(78,205,196,0.2); border-radius: 2px; }
+        input:focus { border-color: rgba(78,205,196,0.5) !important; }
+        button:hover { opacity: 0.85; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+      </style>
+    </head>
+    <body>
+      <div id="root"></div>
+      <script type="module" src="/src/main.jsx"></script>
+    </body>
+  </html>
