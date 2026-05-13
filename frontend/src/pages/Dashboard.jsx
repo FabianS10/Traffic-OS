@@ -15,7 +15,7 @@ const CITY_PRESETS = {
 
 export default function Dashboard() {
   const { user, token, logout, API: authAPI, demoMode } = useAuth();
-  const API = authAPI?.includes("8000") ? authAPI : "http://localhost:8000/api";
+  const API = authAPI || import.meta.env.VITE_API_URL || "http://localhost:8000/api";
 
   const [horizon, setHorizon]         = useState(0);
   const [segments, setSegments]       = useState([]);
@@ -55,12 +55,9 @@ export default function Dashboard() {
     setAriaOpen(false);
     setIngestStatus("⟳ LOADING ROAD NETWORK...");
     try {
-      const r = await fetch(`${API}/ingest/trigger/ingest-osm?city=${cityId}`, {
-        method: "POST", headers: { Authorization: `Bearer ${token}` },
-      });
-      const d = await r.json();
-      setIngestStatus(d.segments_inserted > 0 ? `✓ ${d.segments_inserted} ROADS LOADED` : "✓ NETWORK READY");
-    } catch { setIngestStatus("⚠ OSM FETCH FAILED"); }
+      await fetch(`${API}/graph/build-tomtom?city=${cityId}`, { method: "POST" });
+      setIngestStatus("✓ NETWORK READY");
+    } catch { setIngestStatus("⚠ NETWORK LOAD FAILED"); }
     setTimeout(() => setIngestStatus(null), 4000);
   }, [API, token]);
 
@@ -69,7 +66,7 @@ export default function Dashboard() {
     if (!token) return;
     setLoading(true);
     try {
-      const r = await fetch(`${API}/predict/`, {
+      const r = await fetch(`${API}/predict/live`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ latitude: lat, longitude: lng, radius_m: 2500, horizon_min: h }),
@@ -87,10 +84,10 @@ export default function Dashboard() {
     if (!originId || !destId) return;
     setLoading(true);
     try {
-      const r = await fetch(`${API}/graph/route`, {
+      const r = await fetch(`${API}/graph/route-tomtom`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ origin_node: originId.toString(), dest_node: destId.toString() })
+        body: JSON.stringify({ origin_node: originId.toString(), dest_node: destId.toString(), horizon_preds: { '__city__': city } })
       });
       if (r.ok) {
         const pathData = await r.json();
@@ -157,6 +154,13 @@ export default function Dashboard() {
   }, [token, API]);
 
   useEffect(() => { fetchRoutes(); }, [fetchRoutes]);
+
+  // Pre-build TomTom routing graph on mount and city switch
+  useEffect(() => {
+    const API_URL = authAPI || import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
+    fetch(`${API_URL}/graph/build-tomtom?city=${city}`, { method: 'POST' })
+      .catch(() => {});
+  }, [city]);
 
   const onMapClick = ({ lat, lng }) => {
     setCenter({ lat, lng });

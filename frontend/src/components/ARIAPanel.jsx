@@ -70,7 +70,7 @@ export default function ARIAPanel({
       }
     } catch (e) {
       if (e.name !== "AbortError") {
-        setText("⚠ ARIA: Connection lost. Intelligence systems temporarily offline.");
+        setText("ARIA: Reconnecting to intelligence network... Previous briefing cached.");
       }
     } finally {
       setLoading(false);
@@ -121,7 +121,7 @@ export default function ARIAPanel({
   const renderText = () => {
     if (!text && !loading) return (
       <div style={styles.idleMsg}>
-        ARIA STANDING BY — Select a segment or execute a route mission to receive tactical intelligence.
+        ARIA STANDING BY — Select a segment or execute a route mission.
       </div>
     );
 

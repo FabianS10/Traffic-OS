@@ -120,3 +120,109 @@ async def refresh_graph(
 async def graph_status():
     """Return current graph health metrics."""
     return engine.status()
+
+
+# ── TomTom Live Graph Builder ─────────────────────────────────────────────────
+import math as _math
+from tomtom_live import get_tomtom_live_map_data, normalize_city as _norm_city
+import networkx as _nx
+
+
+async def _build_from_tomtom(city: str) -> dict:
+    """Build routing graph directly from live TomTom coordinates."""
+    global _graph_ready
+    data     = await get_tomtom_live_map_data(city=city)
+    features = data.get("features", [])
+    if not features:
+        return {"nodes": 0, "edges": 0}
+
+    g = engine.graph
+    g.clear()
+    engine._segment_map = {}
+    engine._dist.cache_clear()
+
+    for feat in features:
+        seg_id = str(feat.get("id") or feat["properties"].get("id", 0))
+        coords = feat.get("geometry", {}).get("coordinates", [])
+        if len(coords) < 2:
+            continue
+        speed = max(5.0, float(feat["properties"].get("speed_v") or feat["properties"].get("free_flow_speed") or 30))
+
+        u = (round(coords[0][0],  5), round(coords[0][1],  5))
+        v = (round(coords[-1][0], 5), round(coords[-1][1], 5))
+
+        def hav(a, b):
+            R = 6371000
+            p1, p2 = _math.radians(a[1]), _math.radians(b[1])
+            dp = _math.radians(b[1] - a[1])
+            dl = _math.radians(b[0] - a[0])
+            aa = _math.sin(dp/2)**2 + _math.cos(p1)*_math.cos(p2)*_math.sin(dl/2)**2
+            return 2 * R * _math.asin(_math.sqrt(max(0, aa)))
+
+        length_m = hav(coords[0], coords[-1])
+        cost     = length_m / (speed / 3.6)
+
+        for n in (u, v):
+            if n not in g:
+                g.add_node(n, x=n[0], y=n[1])
+
+        edge_data = {
+            "weight":     cost,
+            "segment_id": seg_id,
+            "length_m":   length_m,
+            "geometry":   {"type": "LineString", "coordinates": coords},
+        }
+        g.add_edge(u, v, **edge_data)
+        g.add_edge(v, u, **edge_data)
+        if seg_id not in engine._segment_map:
+            engine._segment_map[seg_id] = (u, v)
+
+    # Prune islands
+    comps      = sorted(_nx.strongly_connected_components(g), key=len, reverse=True)
+    main_nodes = comps[0] if comps else set()
+    dead       = [n for n in g.nodes if n not in main_nodes]
+    g.remove_nodes_from(dead)
+    engine._segment_map = {
+        sid: (u, v) for sid, (u, v) in engine._segment_map.items()
+        if u in g and v in g
+    }
+    engine._built = True
+    _graph_ready  = True
+
+    stats = {
+        "nodes":    g.number_of_nodes(),
+        "edges":    g.number_of_edges(),
+        "routable": len(engine._segment_map),
+        "source":   "tomtom_live",
+    }
+    logger.info(f"✅ TomTom Graph | nodes={stats['nodes']} routable={stats['routable']}")
+    return stats
+
+
+@router.post("/build-tomtom")
+async def build_graph_from_tomtom(city: str = "fusagasuga"):
+    """Build the A* routing graph from live TomTom segments."""
+    stats = await _build_from_tomtom(city=city)
+    return {"status": "built", **stats}
+
+
+@router.post("/route-tomtom")
+async def route_with_tomtom(request: RouteRequest):
+    """
+    Iron-clad A* routing endpoint.
+    Auto-builds graph from TomTom live data if not ready.
+    Works with or without OSM data in the DB.
+    """
+    global _graph_ready
+    if not _graph_ready or engine.graph.number_of_nodes() < 5:
+        # Detect city from origin_node (TomTom IDs are just integers)
+        # Default to fusagasuga; frontend passes city hint via horizon_preds
+        city = (request.horizon_preds or {}).get("__city__", "fusagasuga")
+        logger.info(f"Auto-building TomTom graph for {city}...")
+        await _build_from_tomtom(city=city)
+
+    return engine.get_optimal_route_astar(
+        origin_id     = request.origin_node,
+        dest_id       = request.dest_node,
+        horizon_preds = {k: v for k, v in (request.horizon_preds or {}).items() if k != "__city__"},
+    )

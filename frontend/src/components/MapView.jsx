@@ -138,7 +138,7 @@ export default function MapView({
   const finalAPI =
     API && !API.includes("undefined")
       ? API.replace(/\/$/, "")
-      : "http://localhost:8000/api";
+      : (import.meta?.env?.VITE_API_URL || "http://localhost:8000/api");
 
   const refreshTrafficData = useCallback(
     async (map, cityKey) => {

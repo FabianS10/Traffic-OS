@@ -1,52 +1,62 @@
 """
-TomTom live traffic adapter for TrafficOS.
-
-- Fetches real TomTom Traffic Flow data from the backend.
-- Never exposes TOMTOM_API_KEY to the frontend.
-- Generates dense live traffic samples for Fusagasugá and central San Francisco.
-- Returns both GeoJSON FeatureCollection and segments[].
+TrafficOS · TomTom Live Traffic Adapter v2
+- Wider city grids (Fusa 20x20, SF 22x22)
+- Persistent disk cache fallback (serves last-known data when TomTom is down)
+- Speed variation fix: each grid point queries a real road segment
+- Robust error handling with synthetic fallback
 """
 
 import os
 import time
 import asyncio
 import hashlib
-from typing import Any, Dict, List, Tuple
+import json
+import math
+import random
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+TOMTOM_API_KEY     = os.getenv("TOMTOM_API_KEY", "").strip()
+CACHE_TTL_SECONDS  = int(os.getenv("TOMTOM_CACHE_TTL_SECONDS", "90"))
+TOMTOM_CONCURRENCY = int(os.getenv("TOMTOM_CONCURRENCY", "20"))
+DISK_CACHE_DIR     = Path(os.getenv("DISK_CACHE_DIR", "/tmp/trafficos_cache"))
 
-TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY", "").strip()
-
-CACHE_TTL_SECONDS = int(os.getenv("TOMTOM_CACHE_TTL_SECONDS", "90"))
-TOMTOM_CONCURRENCY = int(os.getenv("TOMTOM_CONCURRENCY", "16"))
-
-MAX_POINTS = {
-    "fusagasuga": int(os.getenv("TOMTOM_MAX_POINTS_FUSA", "160")),
-    "san_francisco": int(os.getenv("TOMTOM_MAX_POINTS_SF", "220")),
+MAX_POINTS: Dict[str, int] = {
+    "fusagasuga":    int(os.getenv("TOMTOM_MAX_POINTS_FUSA", "220")),
+    "san_francisco": int(os.getenv("TOMTOM_MAX_POINTS_SF",  "280")),
 }
 
-_CACHE: Dict[str, Dict[str, Any]] = {}
+# In-memory cache
+_MEM_CACHE: Dict[str, Dict[str, Any]] = {}
 
-
-CITY_BBOX = {
+# ── City configs ──────────────────────────────────────────────────────────────
+CITY_CFG: Dict[str, Dict] = {
     "fusagasuga": {
-        # Main urban Fusagasugá + surrounding corridors
-        "bbox": (4.3180, 4.3535, -74.3880, -74.3380),
-        "rows": 16,
-        "cols": 16,
+        # Wider bbox: includes all comunas + regional access roads
+        "bbox":           (4.2900, 4.3700, -74.4200, -74.3100),
+        "rows":           20,
+        "cols":           20,
+        "jam_density":    120.0,
+        "free_flow_kmh":  50.0,
+        "label":          "Fusagasugá, Colombia",
     },
     "san_francisco": {
-        # Central SF: Fillmore, Civic Center, SoMa, Mission, downtown
-        "bbox": (37.7480, 37.7960, -122.4470, -122.3880),
-        "rows": 18,
-        "cols": 18,
+        # Wider bbox: includes SOMA, Mission, Castro, Noe, Haight, NoBo, FiDi
+        "bbox":           (37.7200, 37.8100, -122.5100, -122.3600),
+        "rows":           22,
+        "cols":           22,
+        "jam_density":    150.0,
+        "free_flow_kmh":  45.0,
+        "label":          "San Francisco, CA",
     },
 }
 
-
+# ── Named anchor points ───────────────────────────────────────────────────────
 ANCHOR_POINTS: Dict[str, List[Tuple[float, float, str]]] = {
     "fusagasuga": [
+        # Core urban corridors
         (4.3379, -74.3649, "Calle 18"),
         (4.3358, -74.3671, "Carrera 7"),
         (4.3441, -74.3705, "Avenida Las Palmas"),
@@ -57,8 +67,8 @@ ANCHOR_POINTS: Dict[str, List[Tuple[float, float, str]]] = {
         (4.3336, -74.3615, "Carrera 6"),
         (4.3367, -74.3587, "Calle 7A"),
         (4.3395, -74.3568, "Sector Santander"),
-        (4.3272, -74.3679, "Hospital San Rafael Corridor"),
-        (4.3348, -74.3745, "Universidad de Cundinamarca Corridor"),
+        (4.3272, -74.3679, "Hospital San Rafael"),
+        (4.3348, -74.3745, "Universidad Cundinamarca"),
         (4.3457, -74.3547, "Comuna Norte"),
         (4.3298, -74.3496, "La Florida"),
         (4.3215, -74.3607, "La Alejandría"),
@@ -67,8 +77,25 @@ ANCHOR_POINTS: Dict[str, List[Tuple[float, float, str]]] = {
         (4.3460, -74.3665, "Cucharal Urbano"),
         (4.3360, -74.3720, "Variante de Fusagasugá"),
         (4.3310, -74.3775, "Salida Silvania"),
+        (4.3480, -74.3580, "Calle 26A"),
+        (4.3420, -74.3650, "Diagonal 25"),
+        (4.3350, -74.3550, "Calle 21"),
+        (4.3250, -74.3650, "Avenida Santander"),
+        (4.3180, -74.3700, "Via Bogotá Sur"),
+        # Extended corridors
+        (4.3550, -74.3600, "Cucharal Norte"),
+        (4.3150, -74.3550, "Barrio La Paz"),
+        (4.3430, -74.3800, "Salida Arbeláez"),
+        (4.3200, -74.3800, "Via Pandi"),
+        (4.3600, -74.3700, "El Placer"),
+        (4.2950, -74.3600, "Tibacuy Corridor"),
+        (4.3650, -74.3500, "Industrial Norte"),
+        (4.3100, -74.3650, "Via Fusagasugá-Bogotá"),
+        (4.3500, -74.3400, "Autopista Bogotá S"),
+        (4.3450, -74.3850, "Vía Arbeláez Rural"),
     ],
     "san_francisco": [
+        # Core districts
         (37.7749, -122.4194, "Market Street"),
         (37.7840, -122.4075, "Union Square"),
         (37.7890, -122.4010, "Financial District"),
@@ -87,159 +114,158 @@ ANCHOR_POINTS: Dict[str, List[Tuple[float, float, str]]] = {
         (37.7785, -122.4235, "Hayes Valley"),
         (37.7715, -122.4300, "Lower Haight"),
         (37.7810, -122.4315, "Japantown"),
-        (37.7862, -122.4327, "Pacific Heights South"),
+        (37.7862, -122.4327, "Pacific Heights"),
         (37.7757, -122.4032, "SoMa Central"),
         (37.7710, -122.4075, "11th Street Corridor"),
         (37.7598, -122.4267, "Mission Dolores"),
         (37.7554, -122.4193, "Valencia Corridor"),
         (37.7517, -122.4058, "Potrero Avenue"),
+        (37.7950, -122.4030, "Chinatown / North Beach"),
+        (37.7990, -122.4080, "Columbus Avenue"),
+        (37.8020, -122.4190, "Russian Hill"),
+        (37.7920, -122.4300, "Western Addition"),
+        (37.7680, -122.3880, "Dogpatch"),
+        (37.7580, -122.4400, "Noe Valley"),
+        # Extended coverage
+        (37.7450, -122.4200, "Excelsior"),
+        (37.7350, -122.4100, "Outer Mission"),
+        (37.7300, -122.4300, "Ingleside"),
+        (37.7400, -122.4500, "Westwood Highlands"),
+        (37.7550, -122.4700, "Forest Hill"),
+        (37.7700, -122.4600, "Inner Sunset"),
+        (37.7800, -122.4600, "Golden Gate Park N"),
+        (37.7850, -122.4500, "Panhandle"),
+        (37.7950, -122.4400, "Divisadero Corridor"),
+        (37.8050, -122.4100, "Telegraph Hill"),
+        (37.8000, -122.3950, "Embarcadero"),
+        (37.7900, -122.3870, "AT&T Park Corridor"),
+        (37.7730, -122.3800, "Dogpatch S"),
+        (37.7480, -122.3900, "Bayview"),
     ],
 }
 
 
 def normalize_city(city: str) -> str:
-    value = (city or "fusagasuga").lower().strip()
-
-    if value in {"sf", "san francisco", "san-francisco", "san_francisco"}:
+    v = (city or "fusagasuga").lower().strip()
+    if v in {"sf", "san francisco", "san-francisco", "san_francisco"}:
         return "san_francisco"
-
-    if value in {"fusa", "fusagasuga", "fusagasugá"}:
-        return "fusagasuga"
-
     return "fusagasuga"
 
 
 def generate_grid_points(city_key: str) -> List[Tuple[float, float, str]]:
-    cfg = CITY_BBOX[city_key]
+    cfg = CITY_CFG[city_key]
     lat_min, lat_max, lon_min, lon_max = cfg["bbox"]
-    rows = cfg["rows"]
-    cols = cfg["cols"]
-
-    points: List[Tuple[float, float, str]] = []
-
+    rows, cols = cfg["rows"], cfg["cols"]
+    pts: List[Tuple[float, float, str]] = []
     for r in range(rows):
         lat = lat_min + (lat_max - lat_min) * (r / max(rows - 1, 1))
-
         for c in range(cols):
             lon = lon_min + (lon_max - lon_min) * (c / max(cols - 1, 1))
-            points.append(
-                (
-                    lat,
-                    lon,
-                    f"{city_key.replace('_', ' ').title()} Grid {r + 1}-{c + 1}",
-                )
-            )
-
-    return points
+            pts.append((lat, lon, f"Grid {r+1}-{c+1}"))
+    return pts
 
 
 def get_city_points(city_key: str) -> List[Tuple[float, float, str]]:
-    raw_points = ANCHOR_POINTS.get(city_key, []) + generate_grid_points(city_key)
-
-    seen = set()
+    raw = ANCHOR_POINTS.get(city_key, []) + generate_grid_points(city_key)
+    seen: set = set()
     unique: List[Tuple[float, float, str]] = []
-
-    for lat, lon, name in raw_points:
-        key = (round(lat, 5), round(lon, 5))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append((lat, lon, name))
-
+    for lat, lon, name in raw:
+        key = (round(lat, 4), round(lon, 4))
+        if key not in seen:
+            seen.add(key)
+            unique.append((lat, lon, name))
     return unique[:MAX_POINTS[city_key]]
 
 
-def congestion_from_speed(current_speed: float, free_flow_speed: float) -> int:
-    if free_flow_speed <= 0:
-        return 0
-
-    ratio = current_speed / free_flow_speed
-
-    if ratio >= 0.85:
-        return 0
-    if ratio >= 0.65:
-        return 1
-    if ratio >= 0.45:
-        return 2
-    if ratio >= 0.25:
-        return 3
+def congestion_from_speed(current: float, free_flow: float) -> int:
+    if free_flow <= 0: return 0
+    r = current / free_flow
+    if r >= 0.85: return 0
+    if r >= 0.65: return 1
+    if r >= 0.45: return 2
+    if r >= 0.25: return 3
     return 4
 
 
-def status_from_level(level: int) -> str:
-    return ["Free Flow", "Light", "Moderate", "Heavy", "Jam"][max(0, min(level, 4))]
+STATUS_LABELS = ["Free Flow", "Light", "Moderate", "Heavy", "Jam"]
 
 
-def estimate_density_from_speed(
-    current_speed: float,
-    free_flow_speed: float,
-    jam_density: float = 120.0,
-) -> float:
-    if free_flow_speed <= 0:
-        return 0.0
-
-    density = jam_density * (1.0 - (current_speed / free_flow_speed))
-    return max(0.0, min(jam_density, density))
+def estimate_density(current: float, free_flow: float, jam_density: float = 120.0) -> float:
+    if free_flow <= 0: return 0.0
+    return max(0.0, min(jam_density, jam_density * (1.0 - current / free_flow)))
 
 
-def geometry_signature(coordinates: List[List[float]]) -> str:
-    """
-    Less aggressive dedupe so SF does not collapse too many nearby street segments.
-    """
-    if not coordinates:
-        return ""
-
-    compressed = [
-        [round(lon, 5), round(lat, 5)]
-        for lon, lat in coordinates
-    ]
-
-    raw = str(compressed).encode("utf-8")
-    return hashlib.md5(raw).hexdigest()
+def geo_sig(coords: List[List[float]]) -> str:
+    if not coords: return ""
+    compressed = [[round(c[0], 4), round(c[1], 4)] for c in coords]
+    return hashlib.md5(str(compressed).encode()).hexdigest()
 
 
-async def fetch_flow_segment(
+# ── Disk cache helpers ────────────────────────────────────────────────────────
+
+def _disk_cache_path(city_key: str) -> Path:
+    DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return DISK_CACHE_DIR / f"trafficos_{city_key}.json"
+
+
+def _save_disk_cache(city_key: str, payload: Dict) -> None:
+    """Save payload to disk so we can serve it if TomTom goes down."""
+    try:
+        path = _disk_cache_path(city_key)
+        with open(path, "w") as f:
+            json.dump({"ts": time.time(), "payload": payload}, f)
+    except Exception:
+        pass  # Disk cache is best-effort
+
+
+def _load_disk_cache(city_key: str) -> Optional[Dict]:
+    """Load last-known good data from disk."""
+    try:
+        path = _disk_cache_path(city_key)
+        if not path.exists():
+            return None
+        with open(path) as f:
+            data = json.load(f)
+        payload = data.get("payload", {})
+        # Mark as cached
+        payload["mode"] = "cached-fallback"
+        payload["is_real_traffic"] = False
+        payload["cache_age_min"] = round((time.time() - data.get("ts", 0)) / 60, 1)
+        return payload
+    except Exception:
+        return None
+
+
+# ── TomTom fetch ──────────────────────────────────────────────────────────────
+
+async def fetch_flow_point(
     client: httpx.AsyncClient,
-    semaphore: asyncio.Semaphore,
+    sem: asyncio.Semaphore,
     lat: float,
     lon: float,
-    fallback_name: str,
+    name: str,
     idx: int,
-) -> Dict[str, Any] | None:
-    async with semaphore:
+    jam_density: float,
+) -> Optional[Dict[str, Any]]:
+    async with sem:
         url = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
-
-        params = {
-            "point": f"{lat},{lon}",
-            "unit": "KMPH",
-            "key": TOMTOM_API_KEY,
-        }
-
+        params = {"point": f"{lat},{lon}", "unit": "KMPH", "key": TOMTOM_API_KEY}
         try:
-            resp = await client.get(url, params=params)
+            resp = await client.get(url, params=params, timeout=12.0)
             resp.raise_for_status()
-            data = resp.json()
+            fsd = resp.json().get("flowSegmentData", {})
         except Exception as e:
-            return {
-                "error": str(e),
-                "fallback_name": fallback_name,
-                "lat": lat,
-                "lon": lon,
-            }
+            return {"_error": True, "msg": str(e), "lat": lat, "lon": lon, "name": name}
 
-        fsd = data.get("flowSegmentData", {})
+        current_speed   = float(fsd.get("currentSpeed",    0) or 0)
+        free_flow_speed = float(fsd.get("freeFlowSpeed",   max(current_speed, 1)) or 1)
+        travel_time     = float(fsd.get("currentTravelTime",  0) or 0)
+        ff_travel_time  = float(fsd.get("freeFlowTravelTime", 0) or 0)
+        confidence      = float(fsd.get("confidence", 0) or 0)
+        road_closure    = bool(fsd.get("roadClosure", False))
 
-        current_speed = float(fsd.get("currentSpeed", 0) or 0)
-        free_flow_speed = float(fsd.get("freeFlowSpeed", current_speed or 1) or 1)
-        current_travel_time = float(fsd.get("currentTravelTime", 0) or 0)
-        free_flow_travel_time = float(fsd.get("freeFlowTravelTime", 0) or 0)
-        confidence = float(fsd.get("confidence", 0) or 0)
-        road_closure = bool(fsd.get("roadClosure", False))
-
-        coords_raw = fsd.get("coordinates", {}).get("coordinate", [])
-
+        coords_raw  = fsd.get("coordinates", {}).get("coordinate", [])
         coordinates: List[List[float]] = []
-
         for c in coords_raw:
             try:
                 coordinates.append([float(c["longitude"]), float(c["latitude"])])
@@ -247,155 +273,219 @@ async def fetch_flow_segment(
                 continue
 
         if len(coordinates) < 2:
+            # Use a realistic short stub that shows direction
+            offset = 0.0005
             coordinates = [
-                [lon - 0.00045, lat - 0.00025],
-                [lon + 0.00045, lat + 0.00025],
+                [lon - offset, lat - offset * 0.6],
+                [lon,          lat],
+                [lon + offset, lat + offset * 0.6],
             ]
 
-        level = congestion_from_speed(current_speed, free_flow_speed)
+        level     = 4 if road_closure else congestion_from_speed(current_speed, free_flow_speed)
+        density_k = estimate_density(current_speed, free_flow_speed, jam_density)
+        flow_q    = density_k * current_speed
 
-        if road_closure:
-            level = 4
+        mid       = coordinates[len(coordinates) // 2]
+        center_lng, center_lat = mid[0], mid[1]
 
-        density_k = estimate_density_from_speed(current_speed, free_flow_speed)
-        flow_q = density_k * current_speed
+        seg = {
+            "id":                    idx,
+            "segment_id":            idx,
+            "name":                  name,
+            "speed_v":               round(current_speed, 1),
+            "free_flow_speed":       round(free_flow_speed, 1),
+            "density_k":             round(density_k, 1),
+            "flow_q":                round(flow_q, 0),
+            "congestion_level":      level,
+            "status":                STATUS_LABELS[level],
+            "confidence":            round(confidence, 3),
+            "current_travel_time":   travel_time,
+            "free_flow_travel_time": ff_travel_time,
+            "road_closure":          road_closure,
+            "center_lat":            round(center_lat, 6),
+            "center_lng":            round(center_lng, 6),
+            "source":                "tomtom_live",
+            "is_real_traffic":       True,
+        }
+        feat = {
+            "type": "Feature", "id": idx,
+            "properties": {**seg},
+            "geometry": {"type": "LineString", "coordinates": coordinates},
+        }
+        return {"sig": geo_sig(coordinates), "segment": seg, "feature": feat}
 
-        segment = {
-            "id": idx,
-            "segment_id": idx,
-            "name": fallback_name,
-            "speed_v": round(current_speed, 1),
-            "free_flow_speed": round(free_flow_speed, 1),
-            "density_k": round(density_k, 1),
-            "flow_q": round(flow_q, 0),
+
+# ── Synthetic fallback with realistic variation ───────────────────────────────
+
+def _synthetic_payload(city_key: str, points: List, cfg: Dict) -> Dict[str, Any]:
+    """
+    Generates plausible traffic data with realistic speed variation.
+    Used when TomTom API is unavailable AND no disk cache exists.
+    Each point gets a deterministic but varied speed based on:
+    - Location hash (simulates road type variation)
+    - Time of day (rush hour simulation)
+    - Zone congestion pattern (downtown slower, periphery faster)
+    """
+    segments: List[Dict] = []
+    features: List[Dict] = []
+    ff  = cfg["free_flow_kmh"]
+    jd  = cfg["jam_density"]
+    lat_min, lat_max, lon_min, lon_max = cfg["bbox"]
+    lat_center = (lat_min + lat_max) / 2
+    lon_center = (lon_min + lon_max) / 2
+
+    hour = (int(time.time()) // 3600) % 24
+    # Rush hour multiplier (0=free, 1=congested)
+    rush = 0.7 if (7 <= hour <= 9 or 17 <= hour <= 19) else \
+           0.4 if (11 <= hour <= 14) else 0.15
+
+    rng = random.Random(int(time.time() // 3600))  # changes every hour
+
+    for i, (lat, lon, name) in enumerate(points):
+        idx = i + 1
+
+        # Distance from city center (normalized 0-1)
+        dist_norm = min(1.0, math.sqrt(
+            ((lat - lat_center) / (lat_max - lat_min + 0.001)) ** 2 +
+            ((lon - lon_center) / (lon_max - lon_min + 0.001)) ** 2
+        ) * 2)
+
+        # Road type simulation: arterials (anchors) are more congested
+        is_anchor = i < len(ANCHOR_POINTS.get(city_key, []))
+        road_factor = 0.85 if is_anchor else 1.0
+
+        # Location hash for stable per-road variation
+        loc_hash = int(hashlib.md5(f"{round(lat,3)}{round(lon,3)}".encode()).hexdigest()[:4], 16)
+        loc_noise = (loc_hash % 200 - 100) / 1000.0  # ±0.1
+
+        # Downtown is slower
+        downtown_penalty = max(0, (0.5 - dist_norm) * rush * 0.8)
+
+        congestion_ratio = min(0.95, rush * (1.2 - dist_norm * 0.6) * road_factor + downtown_penalty + loc_noise + rng.uniform(-0.05, 0.05))
+        congestion_ratio = max(0.0, congestion_ratio)
+
+        speed   = max(5.0, ff * (1.0 - congestion_ratio * 0.85))
+        density = jd * congestion_ratio * 0.7
+        level   = congestion_from_speed(speed, ff)
+
+        offset = 0.0004
+        coords = [
+            [lon - offset, lat - offset * 0.6],
+            [lon,          lat],
+            [lon + offset, lat + offset * 0.6],
+        ]
+
+        seg = {
+            "id": idx, "segment_id": idx, "name": name,
+            "speed_v":          round(speed, 1),
+            "free_flow_speed":  ff,
+            "density_k":        round(density, 1),
+            "flow_q":           round(density * speed, 0),
             "congestion_level": level,
-            "status": status_from_level(level),
-            "confidence": confidence,
-            "current_travel_time": current_travel_time,
-            "free_flow_travel_time": free_flow_travel_time,
-            "road_closure": road_closure,
-            "geometry": coordinates,
-            "source": "tomtom_live",
-            "is_real_traffic": True,
+            "status":           STATUS_LABELS[level],
+            "confidence":       0.65,
+            "center_lat":       round(lat, 6),
+            "center_lng":       round(lon, 6),
+            "source":           "synthetic",
+            "is_real_traffic":  False,
         }
-
-        feature = {
-            "type": "Feature",
-            "id": idx,
-            "properties": segment,
-            "geometry": {
-                "type": "LineString",
-                "coordinates": coordinates,
-            },
+        feat = {
+            "type": "Feature", "id": idx,
+            "properties": {**seg},
+            "geometry": {"type": "LineString", "coordinates": coords},
         }
+        segments.append(seg)
+        features.append(feat)
 
-        return {
-            "signature": geometry_signature(coordinates),
-            "segment": segment,
-            "feature": feature,
-        }
+    avg_speed = round(sum(s["speed_v"] for s in segments) / max(len(segments), 1), 1)
+    jam_count = sum(1 for s in segments if s["congestion_level"] >= 3)
 
+    return {
+        "city": city_key, "mode": "synthetic-fallback",
+        "source": "Synthetic (no TomTom key / API unavailable)",
+        "is_real_traffic": False,
+        "type": "FeatureCollection",
+        "features": features, "segments": segments,
+        "stats": {"segments": len(segments), "avg_speed": avg_speed, "jams": jam_count, "errors": 0},
+        "errors": [],
+    }
+
+
+# ── Main entry point ──────────────────────────────────────────────────────────
 
 async def get_tomtom_live_map_data(city: str = "fusagasuga") -> Dict[str, Any]:
     city_key = normalize_city(city)
-    points = get_city_points(city_key)
+    points   = get_city_points(city_key)
+    cfg      = CITY_CFG[city_key]
+    cache_key = f"tomtom:{city_key}"
+    now       = time.time()
 
-    cache_key = f"tomtom-live:{city_key}:{len(points)}"
-    now = time.time()
-
-    cached = _CACHE.get(cache_key)
-    if cached and now - cached["timestamp"] < CACHE_TTL_SECONDS:
+    # 1. Memory cache hit
+    cached = _MEM_CACHE.get(cache_key)
+    if cached and now - cached["ts"] < CACHE_TTL_SECONDS:
         return cached["payload"]
 
+    # 2. No TomTom key → disk cache or synthetic
     if not TOMTOM_API_KEY:
-        return {
-            "city": city_key,
-            "mode": "tomtom-live-missing-key",
-            "is_real_traffic": False,
-            "error": "TOMTOM_API_KEY missing on backend.",
-            "type": "FeatureCollection",
-            "features": [],
-            "segments": [],
-        }
+        disk = _load_disk_cache(city_key)
+        if disk:
+            return disk
+        return _synthetic_payload(city_key, points, cfg)
 
-    semaphore = asyncio.Semaphore(TOMTOM_CONCURRENCY)
-
+    # 3. Fetch from TomTom
+    sem = asyncio.Semaphore(TOMTOM_CONCURRENCY)
     async with httpx.AsyncClient(timeout=20.0) as client:
         tasks = [
-            fetch_flow_segment(
-                client=client,
-                semaphore=semaphore,
-                lat=lat,
-                lon=lon,
-                fallback_name=name,
-                idx=idx + 1,
-            )
-            for idx, (lat, lon, name) in enumerate(points)
+            fetch_flow_point(client, sem, lat=lat, lon=lon, name=name, idx=i+1, jam_density=cfg["jam_density"])
+            for i, (lat, lon, name) in enumerate(points)
         ]
-
         results = await asyncio.gather(*tasks)
 
-    segments = []
-    features = []
-    errors = []
-    seen_signatures = set()
+    segments: List[Dict] = []
+    features: List[Dict] = []
+    errors:   List[Dict] = []
+    seen_sigs: set       = set()
 
     for item in results:
-        if not item:
-            continue
-
-        if "error" in item:
+        if not item: continue
+        if item.get("_error"):
             errors.append(item)
             continue
+        sig = item.get("sig", "")
+        if sig and sig in seen_sigs: continue
+        seen_sigs.add(sig)
+        new_id = len(segments) + 1
+        seg    = {**item["segment"], "id": new_id, "segment_id": new_id}
+        feat   = {
+            **item["feature"], "id": new_id,
+            "properties": {**item["feature"]["properties"], "id": new_id, "segment_id": new_id},
+        }
+        segments.append(seg)
+        features.append(feat)
 
-        signature = item.get("signature", "")
+    # If too many errors, fall back to disk cache
+    if len(errors) > len(results) * 0.7:
+        disk = _load_disk_cache(city_key)
+        if disk:
+            return disk
+        return _synthetic_payload(city_key, points, cfg)
 
-        if signature and signature in seen_signatures:
-            continue
-
-        seen_signatures.add(signature)
-
-        segment = item["segment"]
-        segment["id"] = len(segments) + 1
-        segment["segment_id"] = segment["id"]
-
-        feature = item["feature"]
-        feature["id"] = segment["id"]
-        feature["properties"]["id"] = segment["id"]
-        feature["properties"]["segment_id"] = segment["id"]
-
-        segments.append(segment)
-        features.append(feature)
-
-    avg_speed = (
-        round(sum(s["speed_v"] for s in segments) / len(segments), 1)
-        if segments
-        else 0
-    )
-
+    avg_speed = round(sum(s["speed_v"] for s in segments) / max(len(segments), 1), 1)
     jam_count = sum(1 for s in segments if s["congestion_level"] >= 3)
 
     payload = {
-        "city": city_key,
-        "mode": "tomtom-live-dense",
+        "city": city_key, "mode": "tomtom-live-dense",
         "source": "TomTom Traffic Flow Segment Data",
         "is_real_traffic": True,
         "sample_points_requested": len(points),
         "type": "FeatureCollection",
-        "features": features,
-        "segments": segments,
-        "stats": {
-            "segments": len(segments),
-            "avg_speed": avg_speed,
-            "jams": jam_count,
-            "errors": len(errors),
-        },
-        "errors": errors[:5],
+        "features": features, "segments": segments,
+        "stats": {"segments": len(segments), "avg_speed": avg_speed, "jams": jam_count, "errors": len(errors)},
+        "errors": errors[:3],
     }
 
-    _CACHE[cache_key] = {
-        "timestamp": now,
-        "payload": payload,
-    }
+    # Save to both memory and disk cache
+    _MEM_CACHE[cache_key] = {"ts": now, "payload": payload}
+    _save_disk_cache(city_key, payload)
 
     return payload
